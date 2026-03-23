@@ -39,45 +39,76 @@
 
           <q-scroll-area style="height: 40vh">
             <q-list separator>
-              <q-item
-                v-for="spot in filteredSpots"
-                :key="spot.id"
-                clickable
-                :active="selectedSpot?.id === spot.id"
-                active-class="selected-item"
-                @click="selectSpot(spot)"
-              >
-                <q-item-section avatar>
-                  <q-icon name="local_pizza" :color="spot.source === 'local' ? 'warning' : 'negative'" />
-                </q-item-section>
-                <q-item-section>
-                  <q-item-label class="text-weight-medium row items-center no-wrap">
-                    <span class="ellipsis">{{ spot.pizzaName }}</span>
-                    <q-chip
-                      v-if="typeof spot.rating === 'number'"
-                      dense
-                      size="sm"
-                      color="amber-8"
-                      text-color="white"
-                      icon="star"
-                      class="q-ml-xs rating-chip"
+              <template v-for="spot in filteredSpots" :key="spot.id">
+                <q-item
+                  clickable
+                  :active="selectedSpot?.id === spot.id"
+                  active-class="selected-item"
+                  @click="toggleSpotDetails(spot)"
+                >
+                  <q-item-section avatar>
+                    <q-icon name="local_pizza" :color="spot.source === 'local' ? 'warning' : 'negative'" />
+                  </q-item-section>
+                  <q-item-section>
+                    <q-item-label class="text-weight-medium row items-center no-wrap">
+                      <span class="ellipsis">{{ spot.pizzaName }}</span>
+                      <q-chip
+                        v-if="typeof spot.rating === 'number'"
+                        dense
+                        size="sm"
+                        color="amber-8"
+                        text-color="white"
+                        icon="star"
+                        class="q-ml-xs rating-chip"
+                      >
+                        {{ spot.rating.toFixed(1) }}
+                      </q-chip>
+                    </q-item-label>
+                    <q-item-label caption class="text-grey-4">
+                      <template v-if="spot.city || spot.country">
+                        {{ spot.pizzeria }} · {{ spot.city }}, {{ spot.country }}
+                      </template>
+                      <template v-else-if="spot.address">
+                        {{ spot.pizzeria }} · {{ spot.address }}
+                      </template>
+                      <template v-else>
+                        {{ spot.pizzeria }}
+                      </template>
+                    </q-item-label>
+                  </q-item-section>
+                  <q-item-section side>
+                    <q-icon
+                      :name="expandedSpotId === spot.id ? 'expand_less' : 'expand_more'"
+                      color="deep-orange-8"
+                    />
+                  </q-item-section>
+                </q-item>
+                <div v-if="expandedSpotId === spot.id" class="spot-details q-px-md q-pb-md q-pt-xs">
+                  <div class="text-caption text-weight-medium text-deep-orange-9 q-mb-xs">
+                    Recent reviews
+                  </div>
+                  <template v-if="spot.reviews && spot.reviews.length > 0">
+                    <div
+                      v-for="(review, idx) in spot.reviews"
+                      :key="`${spot.id}-review-${idx}`"
+                      class="spot-review q-mb-sm"
                     >
-                      {{ spot.rating.toFixed(1) }}
-                    </q-chip>
-                  </q-item-label>
-                  <q-item-label caption class="text-grey-4">
-                    <template v-if="spot.city || spot.country">
-                      {{ spot.pizzeria }} · {{ spot.city }}, {{ spot.country }}
-                    </template>
-                    <template v-else-if="spot.address">
-                      {{ spot.pizzeria }} · {{ spot.address }}
-                    </template>
-                    <template v-else>
-                      {{ spot.pizzeria }}
-                    </template>
-                  </q-item-label>
-                </q-item-section>
-              </q-item>
+                      <div class="row items-center no-wrap q-gutter-xs text-caption">
+                        <strong>{{ review.author || 'Google user' }}</strong>
+                        <span v-if="typeof review.rating === 'number'" class="text-amber-9">
+                          ★ {{ review.rating.toFixed(1) }}
+                        </span>
+                      </div>
+                      <div class="text-caption text-brown-9 review-text">
+                        {{ review.text }}
+                      </div>
+                    </div>
+                  </template>
+                  <div v-else class="text-caption text-brown-8">
+                    No review snippets available for this place.
+                  </div>
+                </div>
+              </template>
             </q-list>
           </q-scroll-area>
 
@@ -113,6 +144,7 @@
                 :key="spot.id"
                 :lat-lng="[spot.lat, spot.lng]"
                 :icon="pepperoniIcon"
+                :ref="setMarkerRef(spot.id)"
                 @click="selectSpot(spot)"
               >
                 <l-popup>
@@ -151,7 +183,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, ref, watch } from 'vue';
 import { LMap, LMarker, LPopup, LTileLayer } from '@vue-leaflet/vue-leaflet';
 import { divIcon, type Icon, type IconOptions } from 'leaflet';
 import 'leaflet/dist/leaflet.css';
@@ -172,6 +204,13 @@ interface PizzaSpot {
   address?: string;
   mapsUrl?: string;
   photoUrl?: string;
+  reviews?: SpotReview[];
+}
+
+interface SpotReview {
+  author?: string;
+  text: string;
+  rating?: number;
 }
 
 const LOCAL_STORAGE_KEY = 'pizza-world-local-spots';
@@ -227,6 +266,7 @@ const googleSearchSpots = ref<PizzaSpot[]>([]);
 const googleSearchLoading = ref(false);
 const googleSearchError = ref<string | null>(null);
 const googleSearchLoadedFor = ref<string | null>(null);
+const expandedSpotId = ref<string | null>(null);
 
 const googleApiKey = import.meta.env.VITE_GOOGLE_PLACES_API_KEY as string | undefined;
 const minGoogleRating = 4.8;
@@ -241,6 +281,12 @@ const pepperoniIcon = divIcon({
   iconAnchor: [9, 9],
   popupAnchor: [0, -10]
 }) as unknown as Icon<IconOptions>;
+
+type MarkerInstance = {
+  leafletObject?: { openPopup?: () => void };
+};
+
+const markerRefs = new Map<string, MarkerInstance>();
 
 const allSpots = computed(() => [
   ...seedSpots.value,
@@ -282,6 +328,25 @@ function selectSpot(spot: PizzaSpot): void {
   selectedSpot.value = spot;
   center.value = [spot.lat, spot.lng];
   zoom.value = 11;
+  void nextTick(() => {
+    const marker = markerRefs.get(spot.id);
+    marker?.leafletObject?.openPopup?.();
+  });
+}
+
+function toggleSpotDetails(spot: PizzaSpot): void {
+  expandedSpotId.value = expandedSpotId.value === spot.id ? null : spot.id;
+  selectSpot(spot);
+}
+
+function setMarkerRef(spotId: string) {
+  return (marker: unknown): void => {
+    if (!marker) {
+      markerRefs.delete(spotId);
+      return;
+    }
+    markerRefs.set(spotId, marker as MarkerInstance);
+  };
 }
 
 function loadLocalSpots(): void {
@@ -304,6 +369,7 @@ function onClearSearch(): void {
   googleSearchError.value = null;
   googleSearchSpots.value = [];
   googleSearchLoadedFor.value = null;
+  expandedSpotId.value = null;
 }
 
 let googleSearchDebounceTimer: number | undefined;
@@ -337,7 +403,8 @@ async function searchGooglePlacesDirect({
     'places.rating',
     'places.userRatingCount',
     'places.googleMapsUri',
-    'places.photos'
+    'places.photos',
+    'places.reviews'
   ].join(',');
 
   const res = await fetch(endpoint, {
@@ -376,6 +443,11 @@ async function searchGooglePlacesDirect({
     userRatingCount?: unknown;
     googleMapsUri?: unknown;
     photos?: Array<{ name?: unknown }>;
+    reviews?: Array<{
+      text?: { text?: unknown };
+      rating?: unknown;
+      authorAttribution?: { displayName?: unknown };
+    }>;
   };
 
   const normalized = places
@@ -401,6 +473,24 @@ async function searchGooglePlacesDirect({
       const photoUrl = firstPhotoName
         ? `https://places.googleapis.com/v1/${firstPhotoName}/media?maxHeightPx=220&key=${encodeURIComponent(googleApiKey)}`
         : '';
+      const reviewSnippets = Array.isArray(place.reviews)
+        ? place.reviews
+            .map((r): SpotReview | null => {
+              const text = typeof r.text?.text === 'string' ? r.text.text.trim() : '';
+              if (!text) return null;
+              const rating = Number(r.rating);
+              const author =
+                typeof r.authorAttribution?.displayName === 'string'
+                  ? r.authorAttribution.displayName
+                  : undefined;
+              const review: SpotReview = { text };
+              if (author) review.author = author;
+              if (Number.isFinite(rating)) review.rating = rating;
+              return review;
+            })
+            .filter(Boolean)
+            .slice(0, 3) as SpotReview[]
+        : [];
 
       const out: PizzaSpot = {
         id,
@@ -417,6 +507,7 @@ async function searchGooglePlacesDirect({
       if (address) out.address = address;
       if (mapsUrl) out.mapsUrl = mapsUrl;
       if (photoUrl) out.photoUrl = photoUrl;
+      if (reviewSnippets.length > 0) out.reviews = reviewSnippets;
       return out;
     })
     .filter(Boolean) as PizzaSpot[];
@@ -591,6 +682,19 @@ onMounted(() => {
 .rating-chip {
   font-weight: 700;
   letter-spacing: 0.01em;
+}
+
+.spot-details {
+  background: rgba(255, 213, 176, 0.34);
+  border-left: 3px solid rgba(216, 67, 21, 0.65);
+}
+
+.spot-review {
+  padding-left: 2px;
+}
+
+.review-text {
+  line-height: 1.35;
 }
 
 :deep(.pepperoni-marker) {
