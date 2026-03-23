@@ -11,9 +11,8 @@
     "format": "prettier --write \"**/*.{js,ts,vue,scss,html,md,json}\" --ignore-path .gitignore",
     "test": "echo \"No test specified\" && exit 0",
     "dev": "quasar dev",
-    "dev:places-api": "node server/index.mjs",
     "build": "quasar build",
-    "deploy:firebase": "npm run build && firebase deploy --only hosting,functions",
+    "deploy:firebase": "npm run build && firebase deploy --only hosting",
     "postinstall": "quasar prepare"
   },
   "dependencies": {

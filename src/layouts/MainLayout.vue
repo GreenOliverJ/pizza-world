@@ -7,7 +7,7 @@
             <img :src="logoSrc" alt="Pizza World logo" class="pizza-world-logo" />
           </div>
           <div class="pizza-world-wordmark-wrap">
-            <img :src="wordmarkSrc" alt="Pizza World" class="pizza-world-wordmark" />
+            <img :src="wordmarkSrc" alt="Pizza World" class="pizza-world-wordmark q-mb-sm" />
             <div class="text-subtitle2 text-brown-7 text-center">
               Best pizzerias across the globe
             </div>
@@ -111,7 +111,11 @@ import wordmarkSrc from 'src/assets/pizza-world-text.png';
 
 @media (max-width: 599px) {
   .header-brand {
-    gap: 10px;
+    gap: 8px;
+    justify-content: flex-start;
+    width: 100%;
+    position: relative;
+    min-height: 52px;
   }
 
   .pizza-world-logo-wrap,
@@ -121,11 +125,23 @@ import wordmarkSrc from 'src/assets/pizza-world-text.png';
   }
 
   .pizza-world-wordmark {
-    height: 44px;
+    height: 34px;
   }
 
   .pizza-world-wordmark-wrap {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
     align-items: center;
+    text-align: center;
+    width: max-content;
+  }
+
+  .pizza-world-wordmark-wrap .text-subtitle2 {
+    font-size: 0.66rem;
+    line-height: 1.1;
+    margin-top: -2px;
   }
 
   .header-note {
