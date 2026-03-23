@@ -5,6 +5,7 @@ import path from 'node:path';
 
 const PORT = Number(process.env.PORT ?? 3003);
 let GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
+const MIN_GOOGLE_RATING = 4.8;
 
 // Load a simple `.env` file (no external deps) for local development.
 // This keeps the API key out of the browser, while still allowing
@@ -60,6 +61,22 @@ function parseNumber(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function getGoogleMapsUrl({ placeId, lat, lng }) {
+  if (placeId) {
+    return `https://www.google.com/maps/place/?q=place_id:${encodeURIComponent(String(placeId))}`;
+  }
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${lat},${lng}`)}`;
+}
+
+function getPhotoProxyUrl(photoReference, maxwidth = 360) {
+  if (!photoReference) return undefined;
+  const params = new URLSearchParams({
+    photoReference: String(photoReference),
+    maxwidth: String(maxwidth)
+  });
+  return `/api/place-photo?${params.toString()}`;
+}
+
 async function fetchGoogleNearbyPizzerias({ lat, lng, radius, max }) {
   if (!GOOGLE_PLACES_API_KEY) {
     throw new Error('Missing GOOGLE_PLACES_API_KEY env var');
@@ -112,6 +129,10 @@ async function fetchGoogleNearbyPizzerias({ lat, lng, radius, max }) {
           typeof r.user_ratings_total === 'number'
             ? r.user_ratings_total
             : Number(r.user_ratings_total);
+        const photoReference =
+          Array.isArray(r.photos) && r.photos.length > 0
+            ? r.photos[0]?.photo_reference
+            : undefined;
 
         const address =
           typeof r.vicinity === 'string'
@@ -131,10 +152,13 @@ async function fetchGoogleNearbyPizzerias({ lat, lng, radius, max }) {
           source: 'seed',
           rating: Number.isFinite(ratingNum) ? ratingNum : undefined,
           reviewCount: Number.isFinite(reviewCountNum) ? reviewCountNum : undefined,
-          address
+          address,
+          mapsUrl: getGoogleMapsUrl({ placeId: id, lat: latNum, lng: lngNum }),
+          photoUrl: getPhotoProxyUrl(photoReference)
         };
       })
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter((s) => (s.rating ?? 0) >= MIN_GOOGLE_RATING);
 
     // Rank “best” by rating (desc), then review count (desc).
     normalized.sort((a, b) => {
@@ -210,6 +234,10 @@ async function fetchGoogleTextSearchPizzerias({ query, lat, lng, radius, max }) 
           typeof r.user_ratings_total === 'number'
             ? r.user_ratings_total
             : Number(r.user_ratings_total);
+        const photoReference =
+          Array.isArray(r.photos) && r.photos.length > 0
+            ? r.photos[0]?.photo_reference
+            : undefined;
 
         const address =
           typeof r.formatted_address === 'string'
@@ -227,10 +255,13 @@ async function fetchGoogleTextSearchPizzerias({ query, lat, lng, radius, max }) 
           source: 'seed',
           rating: Number.isFinite(ratingNum) ? ratingNum : undefined,
           reviewCount: Number.isFinite(reviewCountNum) ? reviewCountNum : undefined,
-          address
+          address,
+          mapsUrl: getGoogleMapsUrl({ placeId: id, lat: latNum, lng: lngNum }),
+          photoUrl: getPhotoProxyUrl(photoReference)
         };
       })
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter((s) => (s.rating ?? 0) >= MIN_GOOGLE_RATING);
 
     normalized.sort((a, b) => {
       const ar = a.rating ?? 0;
@@ -298,6 +329,36 @@ const server = http.createServer(async (req, res) => {
         max
       });
       return sendJson(res, 200, { spots });
+    }
+
+    if (url.pathname === '/api/place-photo') {
+      const photoReference = url.searchParams.get('photoReference') ?? '';
+      const maxwidth = Math.max(120, Math.min(parseNumber(url.searchParams.get('maxwidth'), 360), 1600));
+
+      if (!GOOGLE_PLACES_API_KEY) {
+        return sendJson(res, 500, { error: 'Missing GOOGLE_PLACES_API_KEY env var' });
+      }
+      if (!photoReference.trim()) {
+        return sendJson(res, 400, { error: 'photoReference is required' });
+      }
+
+      const photoUrl = new URL('https://maps.googleapis.com/maps/api/place/photo');
+      photoUrl.searchParams.set('maxwidth', String(maxwidth));
+      photoUrl.searchParams.set('photoreference', photoReference);
+      photoUrl.searchParams.set('key', GOOGLE_PLACES_API_KEY);
+
+      const response = await fetch(photoUrl);
+      if (!response.ok || !response.body) {
+        return sendJson(res, response.status || 502, { error: 'Unable to fetch place photo' });
+      }
+
+      res.statusCode = 200;
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Content-Type', response.headers.get('content-type') ?? 'image/jpeg');
+
+      const data = Buffer.from(await response.arrayBuffer());
+      return res.end(data);
     }
 
     return sendJson(res, 404, { error: 'Not found' });
