@@ -74,7 +74,7 @@ import wordmarkSrc from 'src/assets/pizza-world-text.png';
 .pizza-world-wordmark-wrap {
   display: inline-flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
   position: relative;
   z-index: 2;
 }
@@ -125,7 +125,7 @@ import wordmarkSrc from 'src/assets/pizza-world-text.png';
   }
 
   .pizza-world-wordmark-wrap {
-    align-items: flex-start;
+    align-items: center;
   }
 
   .header-note {

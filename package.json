@@ -13,6 +13,7 @@
     "dev": "quasar dev",
     "dev:places-api": "node server/index.mjs",
     "build": "quasar build",
+    "deploy:firebase": "npm run build && firebase deploy --only hosting,functions",
     "postinstall": "quasar prepare"
   },
   "dependencies": {
@@ -26,6 +27,7 @@
   "devDependencies": {
     "@eslint/js": "^9.37.0",
     "@quasar/app-vite": "^2.5.1",
+    "@types/leaflet": "^1.9.21",
     "@types/node": "^22.19.11",
     "@vue/eslint-config-prettier": "^10.2.0",
     "@vue/eslint-config-typescript": "^14.7.0",

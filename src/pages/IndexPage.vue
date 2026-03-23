@@ -153,7 +153,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
 import { LMap, LMarker, LPopup, LTileLayer } from '@vue-leaflet/vue-leaflet';
-import { divIcon } from 'leaflet';
+import { divIcon, type Icon, type IconOptions } from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 
 type SpotSource = 'seed' | 'local';
@@ -228,8 +228,7 @@ const googleSearchLoading = ref(false);
 const googleSearchError = ref<string | null>(null);
 const googleSearchLoadedFor = ref<string | null>(null);
 
-const placesApiBaseUrl =
-  (import.meta.env.VITE_PLACES_API_BASE_URL as string | undefined) ?? 'http://localhost:3004';
+const googleApiKey = import.meta.env.VITE_GOOGLE_PLACES_API_KEY as string | undefined;
 const minGoogleRating = 4.8;
 const googleMaxResults = 20;
 const googleSearchDebounceMs = 450;
@@ -241,7 +240,7 @@ const pepperoniIcon = divIcon({
   iconSize: [18, 18],
   iconAnchor: [9, 9],
   popupAnchor: [0, -10]
-});
+}) as unknown as Icon<IconOptions>;
 
 const allSpots = computed(() => [
   ...seedSpots.value,
@@ -251,7 +250,13 @@ const allSpots = computed(() => [
 const filteredSpots = computed(() => {
   const termRaw = search.value.trim();
   const term = termRaw.toLowerCase();
-  if (!term) return allSpots.value;
+  const meetsRatingRule = (spot: PizzaSpot): boolean => {
+    // Local spots are user-managed and can stay visible.
+    if (spot.source === 'local') return true;
+    // For Google/API spots, enforce 4.8+ on client too.
+    return typeof spot.rating === 'number' && spot.rating >= minGoogleRating;
+  };
+  if (!term) return allSpots.value.filter(meetsRatingRule);
 
   const spotMatchesTerm = (spot: PizzaSpot): boolean => {
     return (
@@ -264,13 +269,13 @@ const filteredSpots = computed(() => {
 
   // If we already have Google results for the exact current query, use them.
   if (googleSearchLoadedFor.value === term && googleSearchSpots.value.length > 0) {
-    const localMatches = localSpots.value.filter(spotMatchesTerm);
+    const localMatches = localSpots.value.filter((spot) => spotMatchesTerm(spot) && meetsRatingRule(spot));
     const combined = [...googleSearchSpots.value, ...localMatches];
     return Array.from(new Map(combined.map((s) => [s.id, s])).values());
   }
 
   // Fallback while Google is loading (or if there are no results).
-  return allSpots.value.filter(spotMatchesTerm);
+  return allSpots.value.filter((spot) => spotMatchesTerm(spot) && meetsRatingRule(spot));
 });
 
 function selectSpot(spot: PizzaSpot): void {
@@ -303,6 +308,122 @@ function onClearSearch(): void {
 
 let googleSearchDebounceTimer: number | undefined;
 
+async function searchGooglePlacesDirect({
+  query,
+  lat,
+  lng,
+  radius,
+  max
+}: {
+  query: string;
+  lat: number;
+  lng: number;
+  radius: number;
+  max: number;
+}): Promise<PizzaSpot[]> {
+  if (!googleApiKey) {
+    throw new Error('Missing VITE_GOOGLE_PLACES_API_KEY');
+  }
+
+  const qLower = query.toLowerCase();
+  const textQuery = /pizza|pizzeria/.test(qLower) ? query : `${query} pizza`;
+
+  const endpoint = 'https://places.googleapis.com/v1/places:searchText';
+  const fieldMask = [
+    'places.id',
+    'places.displayName',
+    'places.formattedAddress',
+    'places.location',
+    'places.rating',
+    'places.userRatingCount',
+    'places.googleMapsUri',
+    'places.photos'
+  ].join(',');
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Goog-Api-Key': googleApiKey,
+      'X-Goog-FieldMask': fieldMask
+    },
+    body: JSON.stringify({
+      textQuery,
+      maxResultCount: max,
+      locationBias: {
+        circle: {
+          center: { latitude: lat, longitude: lng },
+          radius
+        }
+      }
+    })
+  });
+
+  if (!res.ok) {
+    const bodyText = await res.text();
+    throw new Error(`Google Places failed: ${res.status} ${bodyText || res.statusText}`);
+  }
+
+  const payload = (await res.json()) as { places?: unknown };
+  const places = Array.isArray(payload.places) ? payload.places : [];
+
+  type RawPlace = {
+    id?: unknown;
+    displayName?: { text?: unknown };
+    formattedAddress?: unknown;
+    location?: { latitude?: unknown; longitude?: unknown };
+    rating?: unknown;
+    userRatingCount?: unknown;
+    googleMapsUri?: unknown;
+    photos?: Array<{ name?: unknown }>;
+  };
+
+  const normalized = places
+    .map((p): PizzaSpot | null => {
+      const place = p as RawPlace;
+      const id = typeof place.id === 'string' ? place.id : null;
+      const pizzeria =
+        typeof place.displayName?.text === 'string' ? place.displayName.text : null;
+      const latNum = Number(place.location?.latitude);
+      const lngNum = Number(place.location?.longitude);
+      if (!id || !pizzeria || !Number.isFinite(latNum) || !Number.isFinite(lngNum)) return null;
+
+      const ratingNum = Number(place.rating);
+      const reviewCountNum = Number(place.userRatingCount);
+      const address =
+        typeof place.formattedAddress === 'string' ? place.formattedAddress : '';
+      const mapsUrl = typeof place.googleMapsUri === 'string' ? place.googleMapsUri : '';
+
+      const firstPhotoName =
+        Array.isArray(place.photos) && place.photos.length > 0 && typeof place.photos[0]?.name === 'string'
+          ? place.photos[0].name
+          : '';
+      const photoUrl = firstPhotoName
+        ? `https://places.googleapis.com/v1/${firstPhotoName}/media?maxHeightPx=220&key=${encodeURIComponent(googleApiKey)}`
+        : '';
+
+      const out: PizzaSpot = {
+        id,
+        country: '',
+        city: '',
+        pizzeria,
+        pizzaName: pizzeria,
+        lat: latNum,
+        lng: lngNum,
+        source: 'seed'
+      };
+      if (Number.isFinite(ratingNum)) out.rating = ratingNum;
+      if (Number.isFinite(reviewCountNum)) out.reviewCount = reviewCountNum;
+      if (address) out.address = address;
+      if (mapsUrl) out.mapsUrl = mapsUrl;
+      if (photoUrl) out.photoUrl = photoUrl;
+      return out;
+    })
+    .filter(Boolean) as PizzaSpot[];
+
+  return normalized.filter((spot) => (spot.rating ?? 0) >= minGoogleRating);
+}
+
 watch(search, (newValue) => {
   const termRaw = String(newValue ?? '').trim();
   const term = termRaw.toLowerCase();
@@ -330,90 +451,13 @@ watch(search, (newValue) => {
         const radius = searchRadiusMeters;
         const max = googleMaxResults;
 
-        const url = new URL('/api/search-pizzerias', placesApiBaseUrl);
-        url.searchParams.set('query', termRaw);
-        url.searchParams.set('lat', String(lat));
-        url.searchParams.set('lng', String(lng));
-        url.searchParams.set('radius', String(radius));
-        url.searchParams.set('max', String(max));
-
-        const res = await fetch(url);
-        if (!res.ok) {
-          throw new Error(`Google proxy failed: ${res.status} ${res.statusText}`);
-        }
-
-        const payload: unknown = await res.json();
-        const spotsCandidate = (payload as { spots?: unknown }).spots;
-        if (!Array.isArray(spotsCandidate)) {
-          throw new Error('Google proxy response did not include a spots array');
-        }
-
-        type RawGoogleSpot = {
-          id?: unknown;
-          country?: unknown;
-          city?: unknown;
-          pizzeria?: unknown;
-          pizzaName?: unknown;
-          lat?: unknown;
-          lng?: unknown;
-          rating?: unknown;
-          reviewCount?: unknown;
-          address?: unknown;
-          mapsUrl?: unknown;
-          photoUrl?: unknown;
-        };
-
-        const normalized = spotsCandidate
-          .map((s: unknown): PizzaSpot | null => {
-            const spot = s as RawGoogleSpot;
-            const id = typeof spot.id === 'string' ? spot.id : null;
-            const pizzeria =
-              typeof spot.pizzeria === 'string' ? spot.pizzeria : (typeof spot.pizzaName === 'string' ? spot.pizzaName : null);
-
-            const pizzaName =
-              typeof spot.pizzaName === 'string' ? spot.pizzaName : (typeof spot.pizzeria === 'string' ? spot.pizzeria : pizzeria);
-
-            const latNum = Number(spot.lat);
-            const lngNum = Number(spot.lng);
-            if (!id || !pizzeria || !Number.isFinite(latNum) || !Number.isFinite(lngNum)) return null;
-
-            const ratingNum = typeof spot.rating === 'number' ? spot.rating : Number(spot.rating);
-            const reviewCountNum =
-              typeof spot.reviewCount === 'number' ? spot.reviewCount : Number(spot.reviewCount);
-
-            const country = typeof spot.country === 'string' ? spot.country : '';
-            const city = typeof spot.city === 'string' ? spot.city : '';
-            const address = typeof spot.address === 'string' ? spot.address : '';
-            const mapsUrl = typeof spot.mapsUrl === 'string' ? spot.mapsUrl : '';
-            const photoUrl = typeof spot.photoUrl === 'string' ? spot.photoUrl : '';
-
-            const out: PizzaSpot = {
-              id,
-              country,
-              city,
-              pizzeria,
-              pizzaName: typeof pizzaName === 'string' ? pizzaName : pizzeria,
-              lat: latNum,
-              lng: lngNum,
-              source: 'seed'
-            };
-
-            if (Number.isFinite(ratingNum)) out.rating = ratingNum;
-            if (Number.isFinite(reviewCountNum)) out.reviewCount = reviewCountNum;
-            if (address) out.address = address;
-            if (mapsUrl) out.mapsUrl = mapsUrl;
-            if (photoUrl) {
-              out.photoUrl = photoUrl.startsWith('http')
-                ? photoUrl
-                : new URL(photoUrl, placesApiBaseUrl).toString();
-            }
-
-            return out;
-          })
-          .filter(Boolean) as PizzaSpot[];
-
-        // Hard guard on client too, in case backend wasn't restarted yet.
-        const ratingFiltered = normalized.filter((spot) => (spot.rating ?? 0) >= minGoogleRating);
+        const ratingFiltered = await searchGooglePlacesDirect({
+          query: termRaw,
+          lat,
+          lng,
+          radius,
+          max
+        });
 
         if (term !== search.value.trim().toLowerCase()) {
           // Query changed while request was in-flight.
