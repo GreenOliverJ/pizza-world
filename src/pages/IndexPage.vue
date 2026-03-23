@@ -23,6 +23,16 @@
                 <q-icon name="search" />
               </template>
             </q-input>
+
+            <div
+              v-if="googleSearchLoading && search.trim().length > 0"
+              class="text-caption text-grey-4 q-mt-sm"
+            >
+              Searching Google...
+            </div>
+            <div v-else-if="googleSearchError" class="text-negative q-mt-sm text-caption">
+              {{ googleSearchError }}
+            </div>
           </q-card-section>
 
           <q-separator dark />
@@ -43,7 +53,15 @@
                 <q-item-section>
                   <q-item-label class="text-weight-medium">{{ spot.pizzaName }}</q-item-label>
                   <q-item-label caption class="text-grey-4">
-                    {{ spot.pizzeria }} · {{ spot.city }}, {{ spot.country }}
+                    <template v-if="spot.city || spot.country">
+                      {{ spot.pizzeria }} · {{ spot.city }}, {{ spot.country }}
+                    </template>
+                    <template v-else-if="spot.address">
+                      {{ spot.pizzeria }} · {{ spot.address }}
+                    </template>
+                    <template v-else>
+                      {{ spot.pizzeria }}
+                    </template>
                   </q-item-label>
                 </q-item-section>
               </q-item>
@@ -169,7 +187,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { LCircleMarker, LMap, LPopup, LTileLayer } from '@vue-leaflet/vue-leaflet';
 import 'leaflet/dist/leaflet.css';
 
@@ -247,13 +265,18 @@ const overpassLoadedCount = ref(0);
 const overpassSpots = ref<PizzaSpot[]>([]);
 
 const googleSpots = ref<PizzaSpot[]>([]);
+const googleSearchSpots = ref<PizzaSpot[]>([]);
 const googleLoading = ref(false);
+const googleSearchLoading = ref(false);
 const googleError = ref<string | null>(null);
+const googleSearchError = ref<string | null>(null);
 const googleLoadedCount = ref(0);
+const googleSearchLoadedFor = ref<string | null>(null);
 
 const placesApiBaseUrl =
-  (import.meta.env.VITE_PLACES_API_BASE_URL as string | undefined) ?? 'http://localhost:3003';
+  (import.meta.env.VITE_PLACES_API_BASE_URL as string | undefined) ?? 'http://localhost:3004';
 const googleMaxResults = 20;
+const googleSearchDebounceMs = 450;
 
 const form = ref({
   country: '',
@@ -272,19 +295,28 @@ const allSpots = computed(() => [
 ]);
 
 const filteredSpots = computed(() => {
-  const term = search.value.trim().toLowerCase();
-  if (!term) {
-    return allSpots.value;
-  }
+  const termRaw = search.value.trim();
+  const term = termRaw.toLowerCase();
+  if (!term) return allSpots.value;
 
-  return allSpots.value.filter((spot) => {
+  const spotMatchesTerm = (spot: PizzaSpot): boolean => {
     return (
       spot.country.toLowerCase().includes(term) ||
       spot.city.toLowerCase().includes(term) ||
       spot.pizzeria.toLowerCase().includes(term) ||
       spot.pizzaName.toLowerCase().includes(term)
     );
-  });
+  };
+
+  // If we already have Google results for the exact current query, use them.
+  if (googleSearchLoadedFor.value === term && googleSearchSpots.value.length > 0) {
+    const localMatches = localSpots.value.filter(spotMatchesTerm);
+    const combined = [...googleSearchSpots.value, ...localMatches];
+    return Array.from(new Map(combined.map((s) => [s.id, s])).values());
+  }
+
+  // Fallback while Google is loading (or if there are no results).
+  return allSpots.value.filter(spotMatchesTerm);
 });
 
 function selectSpot(spot: PizzaSpot): void {
@@ -339,6 +371,127 @@ function loadLocalSpots(): void {
     localSpots.value = [];
   }
 }
+
+let googleSearchDebounceTimer: number | undefined;
+
+watch(search, (newValue) => {
+  const termRaw = newValue.trim();
+  const term = termRaw.toLowerCase();
+
+  // Reset for short queries.
+  if (term.length < 3) {
+    googleSearchLoading.value = false;
+    googleSearchError.value = null;
+    googleSearchSpots.value = [];
+    googleSearchLoadedFor.value = null;
+    return;
+  }
+
+  // Debounce so we don't hit Google on every keystroke.
+  if (googleSearchDebounceTimer) window.clearTimeout(googleSearchDebounceTimer);
+
+  googleSearchDebounceTimer = window.setTimeout(() => {
+    googleSearchLoading.value = true;
+    googleSearchError.value = null;
+    googleSearchSpots.value = [];
+
+    void (async () => {
+      try {
+        const [lat, lng] = center.value;
+        const radius = overpassRadiusMeters.value;
+        const max = googleMaxResults;
+
+        const url = new URL('/api/search-pizzerias', placesApiBaseUrl);
+        url.searchParams.set('query', termRaw);
+        url.searchParams.set('lat', String(lat));
+        url.searchParams.set('lng', String(lng));
+        url.searchParams.set('radius', String(radius));
+        url.searchParams.set('max', String(max));
+
+        const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error(`Google proxy failed: ${res.status} ${res.statusText}`);
+        }
+
+        const payload: unknown = await res.json();
+        const spotsCandidate = (payload as { spots?: unknown }).spots;
+        if (!Array.isArray(spotsCandidate)) {
+          throw new Error('Google proxy response did not include a spots array');
+        }
+
+        type RawGoogleSpot = {
+          id?: unknown;
+          country?: unknown;
+          city?: unknown;
+          pizzeria?: unknown;
+          pizzaName?: unknown;
+          lat?: unknown;
+          lng?: unknown;
+          rating?: unknown;
+          reviewCount?: unknown;
+          address?: unknown;
+        };
+
+        const normalized = spotsCandidate
+          .map((s: unknown): PizzaSpot | null => {
+            const spot = s as RawGoogleSpot;
+            const id = typeof spot.id === 'string' ? spot.id : null;
+            const pizzeria =
+              typeof spot.pizzeria === 'string' ? spot.pizzeria : (typeof spot.pizzaName === 'string' ? spot.pizzaName : null);
+
+            const pizzaName =
+              typeof spot.pizzaName === 'string' ? spot.pizzaName : (typeof spot.pizzeria === 'string' ? spot.pizzeria : pizzeria);
+
+            const latNum = Number(spot.lat);
+            const lngNum = Number(spot.lng);
+            if (!id || !pizzeria || !Number.isFinite(latNum) || !Number.isFinite(lngNum)) return null;
+
+            const ratingNum = typeof spot.rating === 'number' ? spot.rating : Number(spot.rating);
+            const reviewCountNum =
+              typeof spot.reviewCount === 'number' ? spot.reviewCount : Number(spot.reviewCount);
+
+            const country = typeof spot.country === 'string' ? spot.country : '';
+            const city = typeof spot.city === 'string' ? spot.city : '';
+            const address = typeof spot.address === 'string' ? spot.address : '';
+
+            const out: PizzaSpot = {
+              id,
+              country,
+              city,
+              pizzeria,
+              pizzaName: typeof pizzaName === 'string' ? pizzaName : pizzeria,
+              lat: latNum,
+              lng: lngNum,
+              source: 'seed'
+            };
+
+            if (Number.isFinite(ratingNum)) out.rating = ratingNum;
+            if (Number.isFinite(reviewCountNum)) out.reviewCount = reviewCountNum;
+            if (address) out.address = address;
+
+            return out;
+          })
+          .filter(Boolean) as PizzaSpot[];
+
+        if (term !== search.value.trim().toLowerCase()) {
+          // Query changed while request was in-flight.
+          return;
+        }
+
+        googleSearchSpots.value = normalized;
+        googleSearchLoadedFor.value = term;
+      } catch (err) {
+        if (term !== search.value.trim().toLowerCase()) return;
+        googleSearchError.value =
+          err instanceof Error ? err.message : 'Failed to search pizzerias via Google';
+      } finally {
+        if (term === search.value.trim().toLowerCase()) {
+          googleSearchLoading.value = false;
+        }
+      }
+    })();
+  }, googleSearchDebounceMs);
+});
 
 function requestOverpassPizzerias(): void {
   void loadOverpassPizzerias();

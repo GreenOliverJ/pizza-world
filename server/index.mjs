@@ -152,6 +152,101 @@ async function fetchGoogleNearbyPizzerias({ lat, lng, radius, max }) {
   }
 }
 
+async function fetchGoogleTextSearchPizzerias({ query, lat, lng, radius, max }) {
+  if (!GOOGLE_PLACES_API_KEY) {
+    throw new Error('Missing GOOGLE_PLACES_API_KEY env var');
+  }
+
+  const trimmed = String(query ?? '').trim();
+  if (!trimmed) return [];
+
+  // If user didn't mention pizza explicitly, bias towards pizzerias.
+  const qLower = trimmed.toLowerCase();
+  const googleQuery =
+    /pizza|pizzeria/.test(qLower) ? trimmed : `${trimmed} pizza`;
+
+  // Docs: https://developers.google.com/maps/documentation/places/web-service/search-text
+  const googleUrl = new URL('https://maps.googleapis.com/maps/api/place/textsearch/json');
+  googleUrl.searchParams.set('query', googleQuery);
+  googleUrl.searchParams.set('type', 'restaurant');
+  if (Number.isFinite(lat) && Number.isFinite(lng)) {
+    googleUrl.searchParams.set('location', `${lat},${lng}`);
+    googleUrl.searchParams.set('radius', String(radius));
+  }
+  googleUrl.searchParams.set('key', GOOGLE_PLACES_API_KEY);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    let resp;
+    try {
+      resp = await fetch(googleUrl, { signal: controller.signal });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to reach Google Places: ${message}`);
+    }
+
+    const data = await resp.json();
+    if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
+      const msg = data.error_message ? `: ${data.error_message}` : '';
+      throw new Error(`Google Places error (${data.status})${msg}`);
+    }
+
+    const results = Array.isArray(data.results) ? data.results : [];
+
+    const normalized = results
+      .map((r) => {
+        const id = r.place_id;
+        const name = r.name;
+        const location = r.geometry?.location;
+
+        const latNum = Number(location?.lat);
+        const lngNum = Number(location?.lng);
+
+        if (!id || !name || !Number.isFinite(latNum) || !Number.isFinite(lngNum)) return null;
+
+        const ratingNum = typeof r.rating === 'number' ? r.rating : Number(r.rating);
+        const reviewCountNum =
+          typeof r.user_ratings_total === 'number'
+            ? r.user_ratings_total
+            : Number(r.user_ratings_total);
+
+        const address =
+          typeof r.formatted_address === 'string'
+            ? r.formatted_address
+            : (typeof r.vicinity === 'string' ? r.vicinity : '');
+
+        return {
+          id: String(id),
+          country: '',
+          city: '',
+          pizzeria: String(name),
+          pizzaName: String(name),
+          lat: latNum,
+          lng: lngNum,
+          source: 'seed',
+          rating: Number.isFinite(ratingNum) ? ratingNum : undefined,
+          reviewCount: Number.isFinite(reviewCountNum) ? reviewCountNum : undefined,
+          address
+        };
+      })
+      .filter(Boolean);
+
+    normalized.sort((a, b) => {
+      const ar = a.rating ?? 0;
+      const br = b.rating ?? 0;
+      if (br !== ar) return br - ar;
+      const ac = a.reviewCount ?? 0;
+      const bc = b.reviewCount ?? 0;
+      return bc - ac;
+    });
+
+    return normalized.slice(0, max);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (!req.url) return sendJson(res, 404, { error: 'Not found' });
@@ -177,6 +272,31 @@ const server = http.createServer(async (req, res) => {
       }
 
       const spots = await fetchGoogleNearbyPizzerias({ lat, lng, radius, max });
+      return sendJson(res, 200, { spots });
+    }
+
+    if (url.pathname === '/api/search-pizzerias') {
+      const q = url.searchParams.get('query') ?? '';
+      const lat = parseNumber(url.searchParams.get('lat'), NaN);
+      const lng = parseNumber(url.searchParams.get('lng'), NaN);
+      const radius = parseNumber(url.searchParams.get('radius'), 20000);
+      const max = Math.max(1, Math.min(parseNumber(url.searchParams.get('max'), 20), 60));
+
+      if (!String(q).trim()) {
+        return sendJson(res, 400, { error: 'query is required' });
+      }
+
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return sendJson(res, 400, { error: 'lat and lng are required and must be numbers' });
+      }
+
+      const spots = await fetchGoogleTextSearchPizzerias({
+        query: q,
+        lat,
+        lng,
+        radius,
+        max
+      });
       return sendJson(res, 200, { spots });
     }
 
